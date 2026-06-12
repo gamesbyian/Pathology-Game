@@ -581,6 +581,7 @@ function validateSolution(level, pathNodes) {
 
 function validateLevelStructure(level) {
     const errors = [];
+    const warnings = [];
     const L = normaliseLevel(level);
     const { w, h } = L.grid;
     if (!w || !h || w < 1 || h < 1) errors.push('Grid must have positive width and height.');
@@ -605,7 +606,134 @@ function validateLevelStructure(level) {
         if (!inBounds({ x: p.x2, y: p.y2 })) errors.push(`Portal terminal (${p.x2},${p.y2}) out of bounds.`);
     }
 
-    return { valid: errors.length === 0, errors };
+    // ── §10.3 Object Conflicts ────────────────────────────────────────────────
+    // Build a map from packed key → list of object-type labels occupying that cell.
+    // Structural objects that may not share a cell: gate, goal, falseGoal, block,
+    // goose, mustPass, mustCross, filter, flippingFilter, and each portal terminal.
+    const cellOccupants = new Map(); // packedKey → string[]
+    const cellKey = (x, y) => x + (y << 16);
+    const addOccupant = (x, y, label) => {
+        const k = cellKey(x, y);
+        if (!cellOccupants.has(k)) cellOccupants.set(k, []);
+        cellOccupants.get(k).push(label);
+    };
+    for (const c of L.gates)          addOccupant(c.x, c.y, 'gate');
+    if (L.goal)                        addOccupant(L.goal.x, L.goal.y, 'goal');
+    for (const c of L.falseGoals)     addOccupant(c.x, c.y, 'falseGoal');
+    for (const c of L.blocks)         addOccupant(c.x, c.y, 'block');
+    for (const c of L.geese)          addOccupant(c.x, c.y, 'goose');
+    for (const c of L.mustPass)       addOccupant(c.x, c.y, 'mustPass');
+    for (const c of L.mustCross)      addOccupant(c.x, c.y, 'mustCross');
+    for (const f of L.filters)        addOccupant(f.x, f.y, 'filter');
+    for (const f of L.flippingFilters) addOccupant(f.x, f.y, 'flippingFilter');
+    for (let i = 0; i < L.portals.length; i++) {
+        const p = L.portals[i];
+        addOccupant(p.x1, p.y1, `portal[${i}].t1`);
+        addOccupant(p.x2, p.y2, `portal[${i}].t2`);
+    }
+    for (const [k, labels] of cellOccupants) {
+        if (labels.length > 1) {
+            const x = k & 0xFFFF, y = k >> 16;
+            errors.push(`Cell (${x},${y}) has conflicting objects: ${labels.join(', ')}.`);
+        }
+    }
+
+    // ── §10.3 Portal pair rules ───────────────────────────────────────────────
+    // Each portal pair must have two distinct terminal squares.
+    // No two portals may share a terminal square (already caught by cellOccupants
+    // above, but emit a clearer message for the self-loop case).
+    for (let i = 0; i < L.portals.length; i++) {
+        const p = L.portals[i];
+        if (p.x1 === p.x2 && p.y1 === p.y2) {
+            errors.push(`Portal[${i}] both terminals are the same cell (${p.x1},${p.y1}).`);
+        }
+    }
+
+    // ── §10.4 Must-cross structural checks ───────────────────────────────────
+    // Helper: is a cell a block (safe to call even for out-of-bounds coords)?
+    const blockSet = new Set(L.blocks.map(c => cellKey(c.x, c.y)));
+    const isBlock = (x, y) => blockSet.has(cellKey(x, y));
+
+    // Helper: is a cell off-grid or a block?
+    const isBlocked = (x, y) => x < 1 || x > w || y < 1 || y > h || isBlock(x, y);
+
+    // Build quick-lookup sets for geese and filters.
+    const geeseSet = new Set(L.geese.map(c => cellKey(c.x, c.y)));
+    const isGoose = (x, y) => geeseSet.has(cellKey(x, y));
+
+    // Plain-filter-only map (flipping filters can change axis at runtime so static
+    // blocking checks don't apply to them).
+    const plainFilterMap = new Map();
+    for (const f of L.filters) plainFilterMap.set(cellKey(f.x, f.y), f.axis);
+
+    const orthoDirs = [{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+
+    for (const mc of L.mustCross) {
+        const { x, y } = mc;
+
+        // Must not be on the grid edge.
+        if (x === 1 || x === w || y === 1 || y === h) {
+            errors.push(`MustCross (${x},${y}) is on the grid edge; crossing is impossible.`);
+        }
+
+        // Orthogonally adjacent cells must not be blocks or geese.
+        for (const { dx, dy } of orthoDirs) {
+            const nx = x + dx, ny = y + dy;
+            if (isBlock(nx, ny)) {
+                errors.push(`MustCross (${x},${y}) has an adjacent block at (${nx},${ny}), making a crossing impossible.`);
+            }
+            if (isGoose(nx, ny)) {
+                errors.push(`MustCross (${x},${y}) has an adjacent goose at (${nx},${ny}), making a crossing impossible.`);
+            }
+        }
+
+        // A permanent vertical filter immediately left or right blocks horizontal entry/exit.
+        // (Flipping filters are excluded — their axis changes at runtime.)
+        for (const dx of [-1, 1]) {
+            const nx = x + dx, ny = y;
+            const axis = plainFilterMap.get(cellKey(nx, ny));
+            if (axis === 2) {
+                errors.push(`MustCross (${x},${y}) has a vertical filter at (${nx},${ny}) blocking horizontal passage.`);
+            }
+        }
+
+        // A permanent horizontal filter immediately above or below blocks vertical entry/exit.
+        for (const dy of [-1, 1]) {
+            const nx = x, ny = y + dy;
+            const axis = plainFilterMap.get(cellKey(nx, ny));
+            if (axis === 1) {
+                errors.push(`MustCross (${x},${y}) has a horizontal filter at (${nx},${ny}) blocking vertical passage.`);
+            }
+        }
+    }
+
+    // ── §10.5 Accessibility checks ────────────────────────────────────────────
+    // Count open orthogonal sides (not off-grid, not a block).
+    const openSides = (x, y) =>
+        orthoDirs.filter(({ dx, dy }) => !isBlocked(x + dx, y + dy)).length;
+
+    // Every gate must have at least one open orthogonal side.
+    for (const g of L.gates) {
+        if (openSides(g.x, g.y) === 0) {
+            errors.push(`Gate (${g.x},${g.y}) has no open orthogonal side; the path cannot leave it.`);
+        }
+    }
+
+    // The true goal must have at least one open orthogonal side.
+    if (L.goal && inBounds(L.goal)) {
+        if (openSides(L.goal.x, L.goal.y) === 0) {
+            errors.push(`Goal (${L.goal.x},${L.goal.y}) has no open orthogonal side; it cannot be reached.`);
+        }
+    }
+
+    // Every must-pass cell must have at least two open sides (path must enter and exit).
+    for (const mp of L.mustPass) {
+        if (openSides(mp.x, mp.y) < 2) {
+            errors.push(`MustPass (${mp.x},${mp.y}) has fewer than two open sides; path cannot both enter and exit.`);
+        }
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
 }
 
 // ─── Fingerprint ─────────────────────────────────────────────────────────────

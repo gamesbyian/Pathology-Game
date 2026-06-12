@@ -13,10 +13,13 @@ class GridRenderer {
         this.level    = null;
         this.pathState= null;
         this.hintPath = null;          // [{x,y}] or null
+        this.hintAnimStep   = null;    // null=full path, number=draw up to that segment index
         this.showGeese      = true;
         this.showFalseGoals = true;
         this.flipped        = false;   // "Whoa" orientation
         this.bombHighlights = null;    // Set of packed keys
+        this.deadGateKeys   = null;    // Set of packed keys to mark with parity cross
+        this.pendingPortalCell = null; // {x,y} of first portal terminal awaiting partner
         this._rainbowT      = 0;
     }
 
@@ -262,6 +265,43 @@ class GridRenderer {
             ctx.lineWidth = 2;
             ctx.stroke();
         }
+
+        // Dead gate parity cross-outs
+        if (this.deadGateKeys && this.deadGateKeys.size > 0) {
+            ctx.strokeStyle = this._css('--error-color') || '#ef4444';
+            ctx.lineWidth = 2.5;
+            for (const k of this.deadGateKeys) {
+                const { x, y } = E.unpackKey(k);
+                const { rx, ry } = this._cellRect(x, y);
+                ctx.beginPath();
+                ctx.moveTo(rx + cs * 0.18, ry + cs * 0.18);
+                ctx.lineTo(rx + cs * 0.82, ry + cs * 0.82);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(rx + cs * 0.82, ry + cs * 0.18);
+                ctx.lineTo(rx + cs * 0.18, ry + cs * 0.82);
+                ctx.stroke();
+            }
+        }
+
+        // Pending portal indicator (first terminal awaiting partner)
+        if (this.pendingPortalCell) {
+            const { rx, ry } = this._cellRect(this.pendingPortalCell.x, this.pendingPortalCell.y);
+            ctx.save();
+            ctx.strokeStyle = '#6366f1';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([4, 4]);
+            this._drawRoundRect(ctx, rx + 4, ry + 4, cs - 8, cs - 8, cs * 0.3);
+            ctx.strokeStyle = '#6366f1';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#6366f199';
+            ctx.font = `bold ${Math.max(10, cs * 0.28)}px sans-serif`;
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText('◎', rx + cs / 2, ry + cs / 2);
+            ctx.restore();
+        }
     }
 
     _drawPath() {
@@ -273,17 +313,24 @@ class GridRenderer {
         const isRainbow = document.documentElement.dataset.pathRainbow === '1';
         const pathColor = isRainbow ? null : this._css('--path-color');
 
+        // Build portal-pair lookup for correct portal-jump detection
+        const portalPairs = new Set();
+        for (const p of (this.level.portals || [])) {
+            portalPairs.add(`${p.x1},${p.y1}|${p.x2},${p.y2}`);
+            portalPairs.add(`${p.x2},${p.y2}|${p.x1},${p.y1}`);
+        }
+        const isPortalJump = (a, b) => portalPairs.has(`${a.x},${a.y}|${b.x},${b.y}`);
+
         ctx.lineCap  = 'round';
         ctx.lineJoin = 'round';
         ctx.lineWidth = cs * 0.3;
 
         for (let i = 1; i < nodes.length; i++) {
             const a = nodes[i - 1], b = nodes[i];
+            if (isPortalJump(a, b)) continue; // don't draw portal jump segments
+
             const ac = this.cellCenter(a.x, a.y);
             const bc = this.cellCenter(b.x, b.y);
-            const isPortal = (Math.abs(b.x - a.x) + Math.abs(b.y - a.y)) !== 1;
-            if (isPortal) continue; // don't draw portal jump segments
-
             ctx.strokeStyle = isRainbow ? this._rainbowColor(i, nodes.length) : pathColor;
             ctx.beginPath();
             ctx.moveTo(ac.px, ac.py);
@@ -316,28 +363,55 @@ class GridRenderer {
         if (!this.hintPath || this.hintPath.length < 2) return;
         const ctx = this.ctx;
         const cs  = this.cellSize;
+
+        // Build portal-pair lookup
+        const portalPairs = new Set();
+        for (const p of (this.level.portals || [])) {
+            portalPairs.add(`${p.x1},${p.y1}|${p.x2},${p.y2}`);
+            portalPairs.add(`${p.x2},${p.y2}|${p.x1},${p.y1}`);
+        }
+        const isPortalJump = (a, b) => portalPairs.has(`${a.x},${a.y}|${b.x},${b.y}`);
+
+        // hintAnimStep: null = full path; number = draw segments 0..hintAnimStep
+        const maxIdx = this.hintAnimStep !== null
+            ? Math.min(this.hintAnimStep, this.hintPath.length - 1)
+            : this.hintPath.length - 1;
+
         ctx.save();
-        ctx.globalAlpha = 0.35;
+        ctx.globalAlpha = 0.38;
         ctx.strokeStyle = this._css('--path-color') || '#ffffff';
         ctx.lineWidth   = cs * 0.18;
         ctx.lineCap     = 'round';
         ctx.lineJoin    = 'round';
         ctx.setLineDash([cs * 0.18, cs * 0.12]);
         ctx.beginPath();
-        for (let i = 0; i < this.hintPath.length; i++) {
+        for (let i = 0; i <= maxIdx; i++) {
             const n = this.hintPath[i];
             const { px, py } = this.cellCenter(n.x, n.y);
-            if (i === 0) ctx.moveTo(px, py);
-            else {
-                const p = this.hintPath[i - 1];
-                const isPortal = (Math.abs(n.x - p.x) + Math.abs(n.y - p.y)) !== 1;
-                if (isPortal) ctx.moveTo(px, py);
+            if (i === 0) {
+                ctx.moveTo(px, py);
+            } else {
+                const prev = this.hintPath[i - 1];
+                if (isPortalJump(prev, n)) ctx.moveTo(px, py);
                 else ctx.lineTo(px, py);
             }
         }
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.restore();
+
+        // Draw a dot at the animation head when not yet complete
+        if (this.hintAnimStep !== null && this.hintAnimStep < this.hintPath.length - 1) {
+            const head = this.hintPath[maxIdx];
+            const { px, py } = this.cellCenter(head.x, head.y);
+            ctx.save();
+            ctx.globalAlpha = 0.6;
+            ctx.fillStyle = this._css('--path-color') || '#ffffff';
+            ctx.beginPath();
+            ctx.arc(px, py, cs * 0.12, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
     }
 
     _drawHazardOverlay(type, cell) {

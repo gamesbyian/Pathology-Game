@@ -24,6 +24,7 @@ const App = {
     pathState:  null,
     hintIndex:  -1,
     hintPinned: false,
+    _hintAnimTimer: null,
 
     // Edit state
     editLevel:  null,
@@ -158,6 +159,9 @@ function buildUI() {
   <div id="controls-play">
     <button class="ctrl-btn" id="btn-guide">Guide</button>
     <button class="ctrl-btn" id="btn-hint">Hint</button>
+    <span id="hint-counter" style="display:none;font-size:.82em;opacity:.75;margin:0 2px"></span>
+    <button class="ctrl-btn" id="btn-hint-pin" style="display:none">Pin</button>
+    <button class="ctrl-btn" id="btn-hint-clear" style="display:none">Clear</button>
     <button class="ctrl-btn" id="btn-whoa">Whoa</button>
     <button class="ctrl-btn" id="btn-undo">Undo</button>
     <button class="ctrl-btn" id="btn-reset">Reset</button>
@@ -237,6 +241,10 @@ function buildUI() {
   <div id="win-box">
     <div id="win-title">Path Found!</div>
     <div id="win-msg"></div>
+    <div id="win-export-row" style="display:none;margin:.4em 0;font-size:.8em">
+      <input id="win-path-export" readonly style="width:100%;font-family:monospace;font-size:.9em;padding:2px 4px">
+      <button id="btn-win-copy-path" style="margin-top:3px;font-size:.8em">Copy Path</button>
+    </div>
     <div id="win-btns">
       <button id="btn-win-next">Next Level</button>
       <button id="btn-win-stay">Stay</button>
@@ -265,6 +273,8 @@ function buildUI() {
     document.getElementById('btn-mode').addEventListener('click', toggleMode);
     document.getElementById('btn-guide').addEventListener('click', openPlayGuide);
     document.getElementById('btn-hint').addEventListener('click', showHint);
+    document.getElementById('btn-hint-pin').addEventListener('click', pinHint);
+    document.getElementById('btn-hint-clear').addEventListener('click', clearHint);
     document.getElementById('btn-whoa').addEventListener('click', toggleWhoa);
     document.getElementById('btn-undo').addEventListener('click', undoMove);
     document.getElementById('btn-reset').addEventListener('click', resetPath);
@@ -306,6 +316,10 @@ function buildUI() {
     // Win / Hazard modals
     document.getElementById('btn-win-next').addEventListener('click', () => { closeWin(); nextLevel(); });
     document.getElementById('btn-win-stay').addEventListener('click', closeWin);
+    document.getElementById('btn-win-copy-path').addEventListener('click', () => {
+        const val = document.getElementById('win-path-export').value;
+        if (val) navigator.clipboard.writeText(val).then(() => showToast('Path copied'));
+    });
     document.getElementById('btn-hazard-undo').addEventListener('click', () => { closeHazard(); undoMove(); });
     document.getElementById('btn-hazard-reset').addEventListener('click', () => { closeHazard(); resetPath(); });
 }
@@ -348,7 +362,17 @@ function startPlayMode(idx) {
     App.renderer.showGeese      = App.opts.showGeese;
     App.renderer.showFalseGoals = App.opts.showFalseGoals;
     App.renderer.hintPath       = null;
+    App.renderer.hintAnimStep   = null;
     App.renderer.bombHighlights = null;
+    App.renderer.pendingPortalCell = null;
+
+    // Dead gate parity marks (only when showDeadGates is on — dead gates are kept in level)
+    if (App.opts.showDeadGates) {
+        const allDead = computeDeadGates(level);
+        App.renderer.deadGateKeys = allDead.size > 0 ? allDead : null;
+    } else {
+        App.renderer.deadGateKeys = null;
+    }
 
     updatePlayHeader();
     App.renderer.draw();
@@ -408,8 +432,11 @@ function updatePlayHeader() {
     const ps    = App.pathState;
     const idx   = App.currentLevelIndex;
 
+    let done = false;
+    try { done = !!(JSON.parse(localStorage.getItem('pf_done') || '{}')[idx]); } catch {}
+
     document.getElementById('level-title').textContent =
-        `Level ${idx + 1}` + (level.designerName ? ` — ${level.designerName}` : '');
+        `Level ${idx + 1}` + (done ? ' ✓' : '') + (level.designerName ? ` — ${level.designerName}` : '');
 
     const lenEl = document.getElementById('metric-len');
     const intEl = document.getElementById('metric-int');
@@ -457,8 +484,13 @@ function undoMove() {
     }
     App.pathState.undo();
     App.hintIndex  = -1;
-    if (!App.hintPinned) { App.renderer.hintPath = null; }
+    if (!App.hintPinned) {
+        if (App._hintAnimTimer) { clearInterval(App._hintAnimTimer); App._hintAnimTimer = null; }
+        App.renderer.hintPath = null;
+        App.renderer.hintAnimStep = null;
+    }
     updatePlayHeader();
+    updateHintUI(App.playLevel?.hints?.length || 0);
     App.renderer.draw();
     playSound('undo');
 }
@@ -467,8 +499,11 @@ function resetPath() {
     if (!App.pathState) return;
     App.pathState.reset();
     App.hintIndex  = -1;
+    if (App._hintAnimTimer) { clearInterval(App._hintAnimTimer); App._hintAnimTimer = null; }
     App.renderer.hintPath = null;
+    App.renderer.hintAnimStep = null;
     updatePlayHeader();
+    updateHintUI(0);
     App.renderer.draw();
 }
 
@@ -476,12 +511,66 @@ function showHint() {
     if (!App.playLevel) return;
     const hints = App.playLevel.hints;
     if (!hints || !hints.length) {
-        // Try solver
         runHintSolver();
         return;
     }
     App.hintIndex = (App.hintIndex + 1) % hints.length;
-    App.renderer.hintPath = hints[App.hintIndex];
+    _animateHint(hints[App.hintIndex], hints.length);
+}
+
+function _animateHint(path, total) {
+    // Cancel any running animation
+    if (App._hintAnimTimer) { clearInterval(App._hintAnimTimer); App._hintAnimTimer = null; }
+
+    App.renderer.hintPath = path;
+    App.renderer.hintAnimStep = 0;
+    updateHintUI(total);
+    App.renderer.draw();
+
+    App._hintAnimTimer = setInterval(() => {
+        const maxStep = path.length - 1;
+        if (App.renderer.hintAnimStep >= maxStep) {
+            clearInterval(App._hintAnimTimer);
+            App._hintAnimTimer = null;
+            App.renderer.hintAnimStep = null; // show full path
+            App.renderer.draw();
+            return;
+        }
+        App.renderer.hintAnimStep++;
+        App.renderer.draw();
+    }, 80);
+}
+
+function updateHintUI(total) {
+    const counterEl = document.getElementById('hint-counter');
+    const pinEl     = document.getElementById('btn-hint-pin');
+    const clearEl   = document.getElementById('btn-hint-clear');
+    if (!counterEl) return;
+    const visible = App.renderer.hintPath !== null;
+    if (visible && total > 0) {
+        counterEl.textContent = `${App.hintIndex + 1}/${total}`;
+        counterEl.style.display = '';
+    } else {
+        counterEl.style.display = 'none';
+    }
+    if (pinEl) pinEl.style.display = visible ? '' : 'none';
+    if (clearEl) clearEl.style.display = visible ? '' : 'none';
+    if (pinEl) pinEl.textContent = App.hintPinned ? 'Unpin' : 'Pin';
+}
+
+function pinHint() {
+    App.hintPinned = !App.hintPinned;
+    const total = App.playLevel?.hints?.length || 0;
+    updateHintUI(total);
+}
+
+function clearHint() {
+    if (App._hintAnimTimer) { clearInterval(App._hintAnimTimer); App._hintAnimTimer = null; }
+    App.renderer.hintPath = null;
+    App.renderer.hintAnimStep = null;
+    App.hintPinned = false;
+    App.hintIndex = -1;
+    updateHintUI(0);
     App.renderer.draw();
 }
 
@@ -490,8 +579,11 @@ function runHintSolver() {
     const solver = new window.SolverV2(App.playLevel, { budget: 200_000, maxSolutions: 1 });
     showSolverModal('Finding Hint', solver, result => {
         if (result.found && result.paths.length) {
-            App.renderer.hintPath = result.paths[0];
-            App.renderer.draw();
+            // Store discovered hint and animate it
+            if (!App.playLevel.hints) App.playLevel.hints = [];
+            App.playLevel.hints.push(result.paths[0]);
+            App.hintIndex = App.playLevel.hints.length - 1;
+            _animateHint(result.paths[0], App.playLevel.hints.length);
         } else {
             showModal('<h2>No Hint Found</h2><p>Solver exhausted budget without finding a solution.</p><button onclick="closeModal()">OK</button>');
         }
@@ -646,15 +738,29 @@ function closeHazard() {
 
 function showWinModal() {
     const level = App.playLevel;
+    const ps    = App.pathState;
     document.getElementById('win-msg').textContent =
         `Level ${App.currentLevelIndex + 1} complete!` +
         (level.description ? ` ${level.description}` : '');
+
+    const exportRow = document.getElementById('win-export-row');
+    const exportInput = document.getElementById('win-path-export');
+    if (ps && !ps.isEmpty() && exportRow && exportInput) {
+        const pathJson = JSON.stringify(ps.nodes.map(n => window.Engine.packKey(n.x, n.y)));
+        exportInput.value = pathJson;
+        exportRow.style.display = '';
+    } else if (exportRow) {
+        exportRow.style.display = 'none';
+    }
+
     document.getElementById('win-modal').style.display = 'flex';
     playSound('win');
 }
 
 function closeWin() {
     document.getElementById('win-modal').style.display = 'none';
+    const exportRow = document.getElementById('win-export-row');
+    if (exportRow) exportRow.style.display = 'none';
 }
 
 function markLevelComplete() {
@@ -677,12 +783,16 @@ function startEditMode() {
     if (!App.editLevel) {
         App.editLevel = window.Engine.normaliseLevel({ grid: { w: 8, h: 8 }, gates: [], goal: null });
     }
+    App.pendingPortal = null;
     App.editPathState = new window.Engine.PathState(App.editLevel);
     App.renderer.setLevel(App.editLevel, App.editPathState);
-    App.renderer.showGeese      = true;
-    App.renderer.showFalseGoals = true;
-    App.renderer.hintPath       = null;
-    App.renderer.bombHighlights = null;
+    App.renderer.showGeese         = true;
+    App.renderer.showFalseGoals    = true;
+    App.renderer.hintPath          = null;
+    App.renderer.hintAnimStep      = null;
+    App.renderer.bombHighlights    = null;
+    App.renderer.pendingPortalCell = null;
+    App.renderer.deadGateKeys      = null;
     App.editTool = 'gate';
     updatePalette();
     syncEditUI();
@@ -710,6 +820,12 @@ function handleEditPointer(px, py, isStart) {
     if (!cell) return;
     if (!isStart) return; // only respond on click, not drag for most tools
 
+    // When a portal terminal is pending, only portal or eraser (to cancel) are allowed
+    if (App.pendingPortal && tool !== 'portal' && tool !== 'eraser') {
+        showToast('Complete portal placement first (or Erase to cancel)');
+        return;
+    }
+
     pushEditHistory();
 
     const L = App.editLevel;
@@ -732,7 +848,29 @@ function handleEditPointer(px, py, isStart) {
     }
 
     switch (tool) {
-        case 'eraser':  removeFromAll(cell.x, cell.y); break;
+        case 'eraser': {
+            // Cancel any pending portal first
+            if (App.pendingPortal) {
+                App.pendingPortal = null;
+                App.renderer.pendingPortalCell = null;
+            }
+            // If erasing a portal terminal, keep the other as pending
+            const portalPair = (L.portals || []).find(p =>
+                E.packKey(p.x1, p.y1) === ck || E.packKey(p.x2, p.y2) === ck);
+            if (portalPair) {
+                L.portals = (L.portals || []).filter(p => p !== portalPair);
+                const isFirst = E.packKey(portalPair.x1, portalPair.y1) === ck;
+                const other = isFirst
+                    ? { x: portalPair.x2, y: portalPair.y2 }
+                    : { x: portalPair.x1, y: portalPair.y1 };
+                App.pendingPortal = other;
+                App.renderer.pendingPortalCell = { ...other };
+                showToast('Click second portal terminal');
+            } else {
+                removeFromAll(cell.x, cell.y);
+            }
+            break;
+        }
         case 'gate':
             removeFromAll(cell.x, cell.y);
             L.gates.push({ x: cell.x, y: cell.y });
@@ -797,14 +935,28 @@ let _portalColorIdx = 0;
 
 function handlePortalPlacement(cell) {
     const L = App.editLevel;
+    const E = window.Engine;
+    const ck = E.packKey(cell.x, cell.y);
+
     if (!App.pendingPortal) {
         App.pendingPortal = { x: cell.x, y: cell.y };
+        App.renderer.pendingPortalCell = { x: cell.x, y: cell.y };
+        App.renderer.draw();
         showToast('Click second portal terminal');
     } else {
+        // Clicking the same cell cancels placement
+        if (ck === E.packKey(App.pendingPortal.x, App.pendingPortal.y)) {
+            App.pendingPortal = null;
+            App.renderer.pendingPortalCell = null;
+            App.renderer.draw();
+            showToast('Portal placement cancelled');
+            return;
+        }
         const color = PORTAL_COLORS[_portalColorIdx++ % PORTAL_COLORS.length];
         L.portals.push({ x1: App.pendingPortal.x, y1: App.pendingPortal.y,
                          x2: cell.x, y2: cell.y, color });
         App.pendingPortal = null;
+        App.renderer.pendingPortalCell = null;
         App.editLevel = window.Engine.normaliseLevel(L);
         App.editDirty = true;
     }
@@ -994,24 +1146,30 @@ function findBombs() {
     if (!App.editLevel) return;
     const E = window.Engine;
     const L = App.editLevel;
-    const highlights = new Set();
-    // Simple heuristic: cells that are not occupied by structural objects
-    // and where a false goal would plausibly be a trap (connected to goal region)
-    const occupied = new Set();
-    for (const c of [...L.gates, ...(L.blocks||[]), ...(L.mustPass||[]), ...(L.mustCross||[]),
-                      ...(L.geese||[]), ...(L.falseGoals||[]), ...(L.filters||[]), ...(L.flippingFilters||[])])
-        occupied.add(E.packKey(c.x, c.y));
-    if (L.goal) occupied.add(E.packKey(L.goal.x, L.goal.y));
 
-    for (let x = 1; x <= L.grid.w; x++) {
-        for (let y = 1; y <= L.grid.h; y++) {
-            const k = E.packKey(x, y);
-            if (!occupied.has(k)) highlights.add(k);
+    // Run solver to find solution paths, then highlight cells that appear in them.
+    // Those cells are plausible false-goal trap positions.
+    const solver = new window.SolverV2(L, { budget: 200_000, maxSolutions: 5 });
+    showSolverModal('Analyzing Bomb Spots', solver, result => {
+        const highlights = new Set();
+        if (result.found) {
+            const gateSet = E.makeGateSet(L);
+            const goalKey = L.goal ? E.packKey(L.goal.x, L.goal.y) : -1;
+            for (const path of result.paths) {
+                for (const n of path) {
+                    const k = E.packKey(n.x, n.y);
+                    if (!gateSet.has(k) && k !== goalKey) highlights.add(k);
+                }
+            }
         }
-    }
-    App.renderer.bombHighlights = highlights;
-    App.renderer.draw();
-    setTimeout(() => { App.renderer.bombHighlights = null; App.renderer.draw(); }, 3000);
+        if (!highlights.size) {
+            showToast('No bomb spots identified — try Solve first');
+            return;
+        }
+        App.renderer.bombHighlights = highlights;
+        App.renderer.draw();
+        setTimeout(() => { App.renderer.bombHighlights = null; App.renderer.draw(); }, 5000);
+    });
 }
 
 function copyPath() {
@@ -1099,9 +1257,8 @@ function showSolverModal(title, solver, onDone) {
         if (detailEl) detailEl.textContent = `Searching… (${workUsed.toLocaleString()} nodes)`;
     }, 100);
 
-    // Run solver asynchronously in chunks
-    requestAnimationFrame(() => {
-        const result = solver.solve();
+    // Run solver asynchronously (yields every 5000 nodes via rAF)
+    solver.solveAsync(result => {
         clearInterval(tick);
         if (!cancelled) {
             closeModal();
@@ -1232,7 +1389,8 @@ function showSubmitModal(level) {
 
 function toggleMode() {
     if (App.mode === 'play') {
-        App.editLevel = null;
+        // Copy current play level into the editor so the user can tweak it
+        App.editLevel = App.playLevel ? JSON.parse(JSON.stringify(App.playLevel)) : null;
         App.editDirty = false;
         App.editHistory = [];
         startEditMode();
